@@ -1,0 +1,22 @@
+# Конфиг с реальными данными
+holders_config.json
+
+# Логи
+*.txt
+*.log
+
+# Скриншоты (на всякий случай)
+*.png
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
