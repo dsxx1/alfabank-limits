@@ -2,7 +2,7 @@
 holders_config.json
 
 # Логи
-*.txt
+sms_log.txt
 *.log
 
 # Скриншоты (на всякий случай)
