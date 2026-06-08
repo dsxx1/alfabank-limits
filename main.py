@@ -1,18 +1,21 @@
+from __future__ import annotations
+
 import argparse
 import json
 import logging
 import re
 import socket
 import sys
-import time
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from threading import Thread
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
-from playwright.sync_api import sync_playwright, Page
+if TYPE_CHECKING:
+    from playwright.sync_api import Page
 
 # ============================================================
 # АРГУМЕНТЫ
@@ -21,45 +24,103 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Установка лимитов на корпоративные карты Альфа-Бизнес")
     p.add_argument("--config",    default="holders_config.json", help="Путь к конфигу")
     p.add_argument("--port",      type=int, default=8888,        help="Порт SMS-сервера")
-    p.add_argument("--host",      default="0.0.0.0",             help="Хост SMS-сервера")
+    p.add_argument("--host",      default="127.0.0.1",           help="Хост SMS-сервера (0.0.0.0 — слушать всю сеть)")
     p.add_argument("--debug",     action="store_true",           help="Подробные логи")
     p.add_argument("--headless",  action="store_true",           help="Браузер без интерфейса")
     p.add_argument("--sms-token", default="",                    help="Секретный токен для SMS-вебхука")
     return p.parse_args()
-
-ARGS = parse_args()
 
 # ============================================================
 # ЛОГИРОВАНИЕ
 # ============================================================
 LOG_FILE = "sms_log.txt"
 
-logging.basicConfig(
-    level=logging.DEBUG if ARGS.debug else logging.INFO,
-    format="  %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
-    ],
-)
-log = logging.getLogger(__name__)
+log = logging.getLogger("alfabank_limits")
+
+
+def setup_logging(debug: bool) -> None:
+    logging.basicConfig(
+        level=logging.DEBUG if debug else logging.INFO,
+        format="  %(message)s",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        ],
+    )
+
 
 # ============================================================
 # КОНФИГ
 # ============================================================
-try:
-    with open(ARGS.config, "r", encoding="utf-8") as f:
-        CONFIG = json.load(f)
-except FileNotFoundError:
-    log.error(f"Файл конфига не найден: {ARGS.config}")
-    sys.exit(1)
-except json.JSONDecodeError as e:
-    log.error(f"Ошибка парсинга конфига: {e}")
-    sys.exit(1)
+BASE = "https://link.alfabank.ru"
 
-HOLDERS: list[str] = [h.upper() for h in CONFIG["holders"]]
-LIMITS: dict      = CONFIG["limits"]
-BASE              = "https://link.alfabank.ru"
+
+def validate_config(config: dict) -> None:
+    """Проверяет структуру конфига. Бросает ValueError с понятным текстом."""
+    if not isinstance(config, dict):
+        raise ValueError("корень конфига должен быть объектом JSON")
+
+    holders = config.get("holders")
+    if not isinstance(holders, list) or not holders:
+        raise ValueError("'holders' должен быть непустым списком")
+    if not all(isinstance(h, str) and h.strip() for h in holders):
+        raise ValueError("все элементы 'holders' должны быть непустыми строками")
+
+    limits = config.get("limits")
+    if not isinstance(limits, dict):
+        raise ValueError("'limits' должен быть объектом")
+
+    for section in ("all_operations", "cash_withdrawal"):
+        sub = limits.get(section)
+        if not isinstance(sub, dict):
+            raise ValueError(f"'limits.{section}' должен быть объектом")
+        for period in ("day", "month"):
+            value = sub.get(period)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+                raise ValueError(
+                    f"'limits.{section}.{period}' должен быть неотрицательным числом"
+                )
+
+
+def load_config(path: str) -> dict:
+    """Читает и валидирует конфиг. При ошибке логирует и завершает процесс."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+    except FileNotFoundError:
+        log.error(f"Файл конфига не найден: {path}")
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        log.error(f"Ошибка парсинга конфига: {e}")
+        sys.exit(1)
+
+    try:
+        validate_config(config)
+    except ValueError as e:
+        log.error(f"Некорректный конфиг ({path}): {e}")
+        sys.exit(1)
+
+    return config
+
+
+# ============================================================
+# РАЗБОР SMS
+# ============================================================
+SMS_CODE_KEYWORD_RE = re.compile(r"(?:код|code|пароль)[:\s]*(\d{4,6})", re.IGNORECASE)
+SMS_CODE_FALLBACK_RE = re.compile(r"\b(\d{4,6})\b")
+
+
+def extract_sms_code(text: str) -> Optional[str]:
+    """Достаёт 4-6-значный код из текста SMS.
+
+    Сначала ищет код рядом с ключевым словом («код»/«code»/«пароль»), и только
+    если не нашлось — берёт первое отдельно стоящее 4-6-значное число. Это
+    снижает риск выхватить из текста сумму или дату вместо кода.
+    """
+    if not text:
+        return None
+    m = SMS_CODE_KEYWORD_RE.search(text) or SMS_CODE_FALLBACK_RE.search(text)
+    return m.group(1) if m else None
 
 # ============================================================
 # КОНСТАНТЫ
@@ -157,7 +218,7 @@ SMS = SmsState()
 # SMS HTTP-СЕРВЕР
 # ============================================================
 class SMSHandler(BaseHTTPRequestHandler):
-    TOKEN = ARGS.sms_token
+    TOKEN = ""  # задаётся в main() из аргументов
 
     def do_POST(self) -> None:
         try:
@@ -175,12 +236,9 @@ class SMSHandler(BaseHTTPRequestHandler):
 
             sms_text = data.get("content") or data.get("msg") or data.get("text") or ""
 
-            m = re.search(r"(?:код|code)[:\s]*(\d{4,6})", sms_text, re.IGNORECASE)
-            if not m:
-                m = re.search(r"\b(\d{4,6})\b", sms_text)
-
-            if m:
-                SMS.set(m.group(1), sms_text)
+            code = extract_sms_code(sms_text)
+            if code:
+                SMS.set(code, sms_text)
 
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -212,9 +270,9 @@ class SMSHandler(BaseHTTPRequestHandler):
         pass
 
 
-def start_sms_server() -> None:
-    server = HTTPServer((ARGS.host, ARGS.port), SMSHandler)
-    log.info(f"SMS-сервер запущен на {ARGS.host}:{ARGS.port}")
+def start_sms_server(host: str, port: int) -> None:
+    server = HTTPServer((host, port), SMSHandler)
+    log.info(f"SMS-сервер запущен на {host}:{port}")
     server.serve_forever()
 
 # ============================================================
@@ -523,7 +581,7 @@ def _disable_forbid_toggle(page: Page) -> bool:
     return True
 
 
-def _fill_limit_fields(page: Page) -> bool:
+def _fill_limit_fields(page: Page, limits: dict) -> bool:
     """Заполняет поля лимитов из конфига."""
     try:
         page.wait_for_selector(
@@ -535,10 +593,10 @@ def _fill_limit_fields(page: Page) -> bool:
         return False
 
     results = [
-        fill_input(page, "card-limits__input-outlayLimitDay",          LIMITS["all_operations"]["day"]),
-        fill_input(page, "card-limits__input-outlayLimitMonth",        LIMITS["all_operations"]["month"]),
-        fill_input(page, "card-limits__input-withdrawalMoneyLimitDay", LIMITS["cash_withdrawal"]["day"]),
-        fill_input(page, "card-limits__input-withdrawalMoneyLimitMonth", LIMITS["cash_withdrawal"]["month"]),
+        fill_input(page, "card-limits__input-outlayLimitDay",          limits["all_operations"]["day"]),
+        fill_input(page, "card-limits__input-outlayLimitMonth",        limits["all_operations"]["month"]),
+        fill_input(page, "card-limits__input-withdrawalMoneyLimitDay", limits["cash_withdrawal"]["day"]),
+        fill_input(page, "card-limits__input-withdrawalMoneyLimitMonth", limits["cash_withdrawal"]["month"]),
     ]
 
     return all(results)
@@ -571,7 +629,7 @@ def _enable_last_toggles(page: Page, count: int = 2) -> None:
             log.debug(f"  Тумблер #{i + 1} уже включён")
 
 
-def set_limits(page: Page, card_id: str) -> bool:
+def set_limits(page: Page, card_id: str, limits: dict) -> bool:
     if not _navigate_to_limits(page, card_id):
         return False
 
@@ -584,7 +642,7 @@ def set_limits(page: Page, card_id: str) -> bool:
     if not _disable_forbid_toggle(page):
         return False
 
-    if not _fill_limit_fields(page):
+    if not _fill_limit_fields(page, limits):
         return False
 
     _enable_last_toggles(page, count=2)
@@ -604,7 +662,7 @@ def set_limits(page: Page, card_id: str) -> bool:
 # ============================================================
 # PRINT INFO
 # ============================================================
-def print_connection_info() -> None:
+def print_connection_info(args: argparse.Namespace) -> None:
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -613,16 +671,25 @@ def print_connection_info() -> None:
     except Exception:
         local_ip = "127.0.0.1"
 
-    webhook = f"http://{local_ip}:{ARGS.port}/sms"
-    check   = f"http://{local_ip}:{ARGS.port}/check"
-    token_hint = f" (токен: {ARGS.sms_token})" if ARGS.sms_token else " (токен не задан — небезопасно)"
+    # Если сервер слушает все интерфейсы — показываем IP в локальной сети,
+    # иначе адрес, к которому реально привязан сокет (например, 127.0.0.1).
+    display_host = local_ip if args.host in ("0.0.0.0", "::") else args.host
+
+    webhook = f"http://{display_host}:{args.port}/sms"
+    check   = f"http://{display_host}:{args.port}/check"
+    if args.sms_token:
+        token_hint = f" (токен: {args.sms_token})"
+    elif args.host in ("0.0.0.0", "::"):
+        token_hint = " (токен не задан — небезопасно)"
+    else:
+        token_hint = " (только localhost)"
 
     lines = [
         "╔══════════════════════════════════════════════════╗",
         "║            НАСТРОЙКА SMS-ШЛЮЗА                   ║",
         "╠══════════════════════════════════════════════════╣",
-        f"║  Локальный IP:    {local_ip:<29}║",
-        f"║  Порт:            {str(ARGS.port):<29}║",
+        f"║  Локальный IP:    {display_host:<29}║",
+        f"║  Порт:            {str(args.port):<29}║",
         f"║  Безопасность:{token_hint:<35}║",
         "╠══════════════════════════════════════════════════╣",
         f"║  Webhook (POST):  {webhook:<29}║",
@@ -643,20 +710,29 @@ def print_connection_info() -> None:
 # MAIN
 # ============================================================
 def main() -> None:
+    args = parse_args()
+    setup_logging(args.debug)
+    config = load_config(args.config)
+    holders = [h.upper() for h in config["holders"]]
+    limits = config["limits"]
+    SMSHandler.TOKEN = args.sms_token
+
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log.info("=" * 58)
     log.info(f"  ЗАПУСК: {now}")
-    log.info(f"  Держателей: {len(HOLDERS)}")
+    log.info(f"  Держателей: {len(holders)}")
     log.info("=" * 58)
 
-    print_connection_info()
+    print_connection_info(args)
 
-    Thread(target=start_sms_server, daemon=True).start()
+    Thread(target=start_sms_server, args=(args.host, args.port), daemon=True).start()
     time.sleep(0.5)  # даём серверу подняться
+
+    from playwright.sync_api import sync_playwright
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
-            headless=ARGS.headless,
+            headless=args.headless,
             slow_mo=50,
         )
         context = browser.new_context(
@@ -682,9 +758,9 @@ def main() -> None:
 
         results = RunResults()
 
-        for idx, holder in enumerate(HOLDERS, 1):
+        for idx, holder in enumerate(holders, 1):
             print(f"\n{'=' * 58}")
-            print(f"  [{idx}/{len(HOLDERS)}] {holder}")
+            print(f"  [{idx}/{len(holders)}] {holder}")
             print("=" * 58)
 
             page.goto(
@@ -701,7 +777,7 @@ def main() -> None:
                 SMS.reset()
                 continue
 
-            if set_limits(page, card_id):
+            if set_limits(page, card_id, limits):
                 results.ok.append(holder)
             else:
                 results.fail.append(holder)
